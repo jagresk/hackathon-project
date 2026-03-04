@@ -16,63 +16,68 @@ def compute_baselines(training_df):
     for col in ALL_SENSOR_COLS:
         s = training_df[col].dropna()
         baselines[col] = {
-            "mean": s.mean(),
-            "std":  s.std(),
-            "min":  s.min(),
-            "max":  s.max(),
+            "mean":     s.mean(),
+            "std":      s.std(),
+            "min":      s.min(),
+            "max":      s.max(),
             "upper_3s": s.mean() + 3 * s.std(),
             "lower_3s": s.mean() - 3 * s.std(),
         }
     for col in FAULT_COLS:
         flag = training_df[col].astype(str).str.lower() == "true"
-        baselines[col] = {
-            "rate": flag.mean(),
-            "total": int(flag.sum()),
-        }
+        baselines[col] = {"rate": flag.mean(), "total": int(flag.sum())}
     return baselines
 
 
-def detect_anomalies(actual_df, baselines, window=500):
+def compute_joint_correlations(training_df, baselines):
+    for j1, j2 in [(0,1),(1,2),(2,3),(3,4),(4,5)]:
+        ca, cb = f"Current_J{j1}", f"Current_J{j2}"
+        baselines[f"corr_{ca}_{cb}"] = training_df[ca].corr(training_df[cb])
+    return baselines
+
+
+def compute_sensor_fail_baselines(training_df, baselines):
+    for j in range(6):
+        sc, cc = f"Speed_J{j}", f"Current_J{j}"
+        baselines[f"sensor_fail_baseline_{j}"] = len(
+            training_df[(training_df[sc].abs() > 1.0) & (training_df[cc].abs() < 0.05)]
+        )
+    return baselines
+
+
+def detect_anomalies(actual_df, baselines, training_df=None):
     anomalies = []
     df = actual_df.copy()
+    if training_df is None:
+        training_df = pd.DataFrame(columns=df.columns)
 
     # ── 1. ELECTRICAL OVERLOAD ────────────────────────────────────────────────
-    # Require a sustained burst (>=10 consecutive rows) above 3-sigma threshold
-    # to avoid single-sample noise
+    # Find the longest sustained run above 3-sigma threshold (>=10 rows)
     for col in CURRENT_COLS:
         threshold = baselines[col]["upper_3s"]
-        above = (df[col] > threshold).astype(int)
-        # Find runs of consecutive hits
-        run_start = None
-        best_run = 0
-        best_start = best_end = None
+        above = (df[col] > threshold).astype(int).values
+        runs, in_run, start = [], False, 0
         for i, v in enumerate(above):
-            if v:
-                if run_start is None:
-                    run_start = i
-            else:
-                if run_start is not None:
-                    run_len = i - run_start
-                    if run_len > best_run:
-                        best_run = run_len
-                        best_start, best_end = run_start, i - 1
-                    run_start = None
-        if run_start is not None:
-            run_len = len(above) - run_start
-            if run_len > best_run:
-                best_run = run_len
-                best_start, best_end = run_start, len(above) - 1
-
-        if best_run >= 10:
-            peak = df[col].iloc[best_start:best_end+1].max()
+            if v and not in_run:
+                start, in_run = i, True
+            elif not v and in_run:
+                runs.append((start, i - 1, i - start))
+                in_run = False
+        if in_run:
+            runs.append((start, len(above) - 1, len(above) - start))
+        if not runs:
+            continue
+        best = max(runs, key=lambda x: x[2])
+        if best[2] >= 10:
+            peak = df[col].iloc[best[0]:best[1]+1].max()
             anomalies.append({
                 "type": "Electrical Overload",
                 "severity": "HIGH",
                 "sensor": col,
-                "description": f"{col} sustained {best_run} readings above {threshold:.2f}A (3-sigma), peaking at {peak:.2f}A.",
+                "description": f"{col} sustained {best[2]} consecutive readings above {threshold:.2f}A (3σ), peaking at {peak:.2f}A.",
                 "action": f"Inspect motor driver for {col}. Check for mechanical binding or short circuit.",
-                "row_start": int(df.index[best_start]),
-                "row_end":   int(df.index[best_end]),
+                "row_start": int(df.index[best[0]]),
+                "row_end":   int(df.index[best[1]]),
             })
 
     # ── 2. OVERHEATING ────────────────────────────────────────────────────────
@@ -84,66 +89,85 @@ def detect_anomalies(actual_df, baselines, window=500):
                 "type": "Overheating",
                 "severity": "HIGH",
                 "sensor": col,
-                "description": f"{col} reached {hot[col].max():.2f}°C — exceeded {threshold:.2f}°C threshold on {len(hot)} readings.",
+                "description": f"{col} exceeded {threshold:.2f}°C on {len(hot)} consecutive readings, peaking at {hot[col].max():.2f}°C.",
                 "action": f"Inspect cooling fan and thermal paste on {col} motor housing.",
                 "row_start": int(hot.index[0]),
                 "row_end":   int(hot.index[-1]),
             })
 
     # ── 3. REPEATED SAFETY STOPS ──────────────────────────────────────────────
-    # Look for a cluster: 10+ stops within a 200-row window (vs baseline ~0.14%)
+    # Find the tightest cluster using gap<=20 rows between stops
     stops = (df["Robot_ProtectiveStop"].astype(str).str.lower() == "true")
     baseline_rate = baselines["Robot_ProtectiveStop"]["rate"]
-    cluster_window = 200
-    for i in range(0, len(df) - cluster_window):
-        seg = stops.iloc[i:i+cluster_window]
-        if seg.sum() >= 10 and seg.mean() > baseline_rate * 10:
+    stop_idx = stops[stops].index.tolist()
+    if stop_idx:
+        clusters, cur = [], [stop_idx[0]]
+        for i in range(1, len(stop_idx)):
+            if stop_idx[i] - stop_idx[i-1] <= 20:
+                cur.append(stop_idx[i])
+            else:
+                clusters.append(cur)
+                cur = [stop_idx[i]]
+        clusters.append(cur)
+        best = max(clusters, key=len)
+        window = best[-1] - best[0] + 1
+        rate = len(best) / window
+        if len(best) >= 5 and rate > baseline_rate * 10:
+            # Find the tightest sub-window containing 10 stops
+            sub_size = min(10, len(best))
+            tightest = min(
+                [best[i:i+sub_size] for i in range(len(best)-sub_size+1)],
+                key=lambda s: s[-1] - s[0]
+            )
+            t_span = tightest[-1] - tightest[0]
+            t_rate = sub_size / max(t_span, 1)
             anomalies.append({
                 "type": "Repeated Safety Stops",
                 "severity": "HIGH",
                 "sensor": "Robot_ProtectiveStop",
-                "description": f"{int(seg.sum())} protective stops in rows {i}–{i+cluster_window} ({seg.mean()*100:.1f}% vs {baseline_rate*100:.2f}% baseline).",
+                "description": f"{sub_size} protective stops in rows {tightest[0]}–{tightest[-1]} (span={t_span} rows, {t_rate*100:.1f}% density vs {baseline_rate*100:.2f}% baseline).",
                 "action": "Inspect work envelope for obstacles. Review path planning and collision zones.",
-                "row_start": i,
-                "row_end": i + cluster_window,
+                "row_start": int(tightest[0]),
+                "row_end":   int(tightest[-1]),
             })
-            break  # Report once for the cluster
 
     # ── 4. WEAR AND TEAR ─────────────────────────────────────────────────────
-    # Compare rolling 500-row mean to global baseline mean.
-    # Flag if a sustained window deviates >2 std from baseline mean.
+    # Use 100-row rolling window. Report only the single worst-deviation sensor
+    # to avoid double-counting co-occurring load shifts on adjacent joints.
+    best_wear = None
+    best_dev_max = 0.0
     for col in CURRENT_COLS:
-        baseline_mean = baselines[col]["mean"]
-        baseline_std  = baselines[col]["std"]
-        rolling_mean  = df[col].rolling(500).mean().dropna()
-        deviation     = (rolling_mean - baseline_mean).abs()
-        sustained     = deviation[deviation > 1.5 * baseline_std]
-        if len(sustained) >= 100:
-            worst_dev = deviation.max()
-            anomalies.append({
-                "type": "Wear and Tear",
-                "severity": "MEDIUM",
-                "sensor": col,
-                "description": f"{col} rolling mean deviated up to {worst_dev:.3f}A from baseline ({baseline_mean:.3f}A) across {len(sustained)} readings. Gradual load shift detected.",
-                "action": f"Schedule lubrication and bearing inspection for {col}.",
-                "row_start": int(sustained.index[0]),
-                "row_end":   int(sustained.index[-1]),
-            })
+        bm = baselines[col]["mean"]
+        bs = baselines[col]["std"]
+        rolling = df[col].rolling(100).mean().dropna()
+        dev = (rolling - bm).abs()
+        sustained = dev[dev > 2.0 * bs]
+        if len(sustained) >= 50 and dev.max() > best_dev_max:
+            best_dev_max = dev.max()
+            best_wear = (col, bm, dev.max(), int(sustained.index[0]), int(sustained.index[-1]))
+    if best_wear:
+        col, bm, max_dev, rs, re = best_wear
+        anomalies.append({
+            "type": "Wear and Tear",
+            "severity": "MEDIUM",
+            "sensor": col,
+            "description": f"{col} rolling mean deviated up to {max_dev:.3f}A from baseline ({bm:.3f}A) across rows {rs}–{re}.",
+            "action": f"Schedule lubrication and bearing inspection for {col}.",
+            "row_start": rs,
+            "row_end":   re,
+        })
 
     # ── 5. SENSOR FAILURE ─────────────────────────────────────────────────────
-    # Only flag if there is a dense cluster (>=20 rows within 10-row gaps of each other)
-    # This avoids single scattered readings that appear in training data too
+    # Only report the largest dense cluster (gap<=5 rows)
     for j in range(6):
-        speed_col   = f"Speed_J{j}"
-        current_col = f"Current_J{j}"
-        suspect = df[(df[speed_col].abs() > 1.0) & (df[current_col].abs() < 0.05)]
+        sc, cc = f"Speed_J{j}", f"Current_J{j}"
+        suspect = df[(df[sc].abs() > 1.0) & (df[cc].abs() < 0.05)]
         if suspect.empty:
             continue
-        # Find largest dense cluster
         idx = suspect.index.tolist()
         clusters, cur = [], [idx[0]]
         for i in range(1, len(idx)):
-            if idx[i] - idx[i-1] <= 10:
+            if idx[i] - idx[i-1] <= 5:
                 cur.append(idx[i])
             else:
                 clusters.append(cur)
@@ -151,166 +175,150 @@ def detect_anomalies(actual_df, baselines, window=500):
         clusters.append(cur)
         best = max(clusters, key=len)
         train_count = baselines.get(f"sensor_fail_baseline_{j}", 0)
-        # Only report the cluster if it is substantially larger than training baseline
         if len(best) >= max(20, train_count * 5):
             anomalies.append({
                 "type": "Sensor Failure",
                 "severity": "MEDIUM",
-                "sensor": speed_col,
-                "description": f"J{j}: dense cluster of {len(best)} physically inconsistent readings (speed>1.0, current<0.05A) in rows {best[0]}–{best[-1]} (baseline: ~{train_count} scattered).",
+                "sensor": sc,
+                "description": f"J{j}: {len(best)} consecutive physically inconsistent readings (speed>1.0A, current<0.05A) in rows {best[0]}–{best[-1]}.",
                 "action": f"Inspect speed encoder on Joint {j}. May require recalibration or replacement.",
                 "row_start": int(best[0]),
                 "row_end":   int(best[-1]),
             })
 
     # ── 6. ELECTRICAL NOISE ───────────────────────────────────────────────────
-    # Rolling std must exceed 3x baseline std (not 2.5x) to reduce false positives
+    # Use 50-row window for tightest noise burst detection
     for col in CURRENT_COLS:
-        baseline_std = baselines[col]["std"]
-        rolling_std = df[col].rolling(window=100).std()
-        noisy = rolling_std[rolling_std > baseline_std * 3.0].dropna()
-        if len(noisy) > 50:
+        bs = baselines[col]["std"]
+        rolling_std = df[col].rolling(50).std().dropna()
+        noisy = rolling_std[rolling_std > bs * 3.0]
+        if len(noisy) >= 20:
             anomalies.append({
                 "type": "Electrical Noise",
                 "severity": "MEDIUM",
                 "sensor": col,
-                "description": f"{col} rolling std reached {noisy.max():.3f} (>{baseline_std*3:.3f}, 3x baseline). Sustained noise on {len(noisy)} readings.",
+                "description": f"{col} rolling std peaked at {noisy.max():.3f} (>{bs*3:.3f}, 3× baseline) across rows {int(noisy.index[0])}–{int(noisy.index[-1])}.",
                 "action": "Check wiring connections and shielding. Possible EMI interference.",
                 "row_start": int(noisy.index[0]),
                 "row_end":   int(noisy.index[-1]),
             })
 
     # ── 7. CONTROL ISSUES ────────────────────────────────────────────────────
-    # Scan in rolling 500-row windows to find the specific region of oscillation.
-    # Training temps have near-zero variance so any sustained ACF in actual is anomalous.
-    osc_window = 500
-    osc_step   = 100
-    best_window_start = None
-    best_window_acf   = 0.0
-    best_window_sensor = None
-    for i in range(0, len(df) - osc_window, osc_step):
-        for col in TEMP_COLS:
-            seg = df[col].iloc[i:i+osc_window]
-            seg = seg - seg.mean()
-            if seg.std() < 1e-6:
+    # Scan 150-row windows, compare actual ACF vs training ACF in same window.
+    # Report only the single best hit (highest ACF excess over training).
+    osc_w = 75
+    best_excess, best_start, best_end, best_sensor = 0.0, 0, 0, None
+    max_rows = min(len(df), len(training_df))
+    for col in TEMP_COLS:
+        for i in range(0, max_rows - osc_w, 25):
+            sa = df[col].iloc[i:i+osc_w]
+            st = training_df[col].iloc[i:i+osc_w].dropna()
+            sa_d = sa - sa.mean()
+            if sa_d.std() < 1e-6 or len(st) < osc_w // 2:
                 continue
-            acf_vals = [seg.autocorr(lag=lag) for lag in range(5, 20)]
-            max_acf = max(acf_vals)
-            if max_acf > best_window_acf:
-                best_window_acf   = max_acf
-                best_window_start = i
-                best_window_sensor = col
-
-    if best_window_acf > 0.5:
-        row_end = best_window_start + osc_window
+            st_d = st - st.mean()
+            a_acf = max([sa_d.autocorr(lag=l) for l in range(3, 12)])
+            t_acf = max([st_d.autocorr(lag=l) for l in range(3, 12)]) if st_d.std() > 1e-6 else 0.0
+            excess = a_acf - t_acf
+            if excess > best_excess and a_acf > 0.7:
+                best_excess = excess
+                best_start, best_end, best_sensor = i, i + osc_w, col
+    if best_excess > 0.3:
         anomalies.append({
             "type": "Control Issues",
             "severity": "HARD",
-            "sensor": best_window_sensor,
-            "description": f"Periodic temperature oscillation in rows {best_window_start}–{row_end} (max acf={best_window_acf:.3f}). Suggests control loop instability.",
-            "action": "Review PID tuning for thermal controllers. Check for mechanical resonance or feedback loop issues.",
-            "row_start": best_window_start,
-            "row_end": row_end,
+            "sensor": best_sensor,
+            "description": f"Periodic oscillation on {best_sensor} in rows {best_start}–{best_end} (ACF={best_excess+0:.3f} above training baseline). Control loop instability.",
+            "action": "Review PID tuning for thermal controllers. Check for mechanical resonance.",
+            "row_start": best_start,
+            "row_end":   best_end,
         })
 
     # ── 8. COORDINATION PROBLEMS ──────────────────────────────────────────────
-    # Primary: current correlation flip. Fallback: grip_lost rate doubling
-    # (grip failures indicate end-effector coordination breakdown)
-    joint_pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+    # Primary: current correlation flip between adjacent joints
     coord_found = False
-    for j1, j2 in joint_pairs:
-        col_a = f"Current_J{j1}"
-        col_b = f"Current_J{j2}"
-        base_corr = baselines.get(f"corr_{col_a}_{col_b}")
+    for j1, j2 in [(0,1),(1,2),(2,3),(3,4),(4,5)]:
+        ca, cb = f"Current_J{j1}", f"Current_J{j2}"
+        base_corr = baselines.get(f"corr_{ca}_{cb}")
         if base_corr is None:
             continue
-        actual_corr = df[col_a].corr(df[col_b])
+        actual_corr = df[ca].corr(df[cb])
         if base_corr > 0.3 and actual_corr < -0.2:
             anomalies.append({
                 "type": "Coordination Problems",
                 "severity": "HARD",
-                "sensor": f"{col_a}/{col_b}",
-                "description": f"J{j1}–J{j2} correlation flipped: baseline {base_corr:.2f} → actual {actual_corr:.2f}. Joints working against each other.",
-                "action": f"Inspect mechanical coupling between Joint {j1} and Joint {j2}. Check for backlash or binding.",
+                "sensor": f"{ca}/{cb}",
+                "description": f"J{j1}–J{j2} current correlation flipped: baseline {base_corr:.2f} → actual {actual_corr:.2f}.",
+                "action": f"Inspect mechanical coupling between Joint {j1} and Joint {j2}. Check for backlash.",
                 "row_start": 0,
-                "row_end": len(df) - 1,
+                "row_end":   len(df) - 1,
             })
             coord_found = True
 
     if not coord_found:
-        # Fallback: find the 2000-row window with the highest grip failure density
-        baseline_grip_rate = baselines["grip_lost"]["rate"]
+        # Fallback: tightest window with highest grip failure rate ratio
         actual_grip = (df["grip_lost"].astype(str).str.lower() == "true").astype(int)
-        grip_window = 2000
-        rolling_grip = actual_grip.rolling(grip_window).sum()
-        baseline_expected = baseline_grip_rate * grip_window
-        max_grip_count = rolling_grip.max()
-        if max_grip_count >= max(3, baseline_expected * 3):
-            end_idx = int(rolling_grip.idxmax())
-            start_idx = max(0, end_idx - grip_window)
-            window_rate = max_grip_count / grip_window
+        baseline_grip_rate = baselines["grip_lost"]["rate"]
+        best_ratio, best_result = 0.0, None
+        for w in [100, 200, 300, 500]:
+            roll = actual_grip.rolling(w).sum()
+            peak = roll.max()
+            ratio = peak / max(baseline_grip_rate * w, 0.01)
+            if ratio > best_ratio and peak >= 2:
+                end_i   = int(roll.idxmax())
+                start_i = max(0, end_i - w)
+                best_ratio   = ratio
+                best_result  = (start_i, end_i, int(peak), ratio)
+        if best_result and best_ratio >= 4.0:
+            s, e, cnt, ratio = best_result
             anomalies.append({
                 "type": "Coordination Problems",
                 "severity": "HARD",
                 "sensor": "grip_lost",
-                "description": f"{int(max_grip_count)} grip failures in rows {start_idx}–{end_idx} ({window_rate*100:.2f}% vs {baseline_grip_rate*100:.3f}% baseline). Elevated failure density indicates coordination breakdown.",
-                "action": "Inspect gripper mechanism and path coordination. Check for timing misalignment between arm and gripper.",
-                "row_start": start_idx,
-                "row_end": end_idx,
+                "description": f"{cnt} grip failures in rows {s}–{e} ({ratio:.1f}× baseline rate). End-effector coordination breakdown.",
+                "action": "Inspect gripper mechanism. Check for timing misalignment between arm and gripper.",
+                "row_start": s,
+                "row_end":   e,
             })
 
     # ── 9. EARLY DEGRADATION ─────────────────────────────────────────────────
-    # Compare first segment RMS to rest of run — a spike in segment 0 is the signal
-    chunk_size = len(df) // 10
-    rms_segments = []
-    for i in range(10):
-        chunk = df[CURRENT_COLS].iloc[i*chunk_size:(i+1)*chunk_size]
-        rms_segments.append(np.sqrt((chunk**2).mean().mean()))
-
-    rest_mean = np.mean(rms_segments[1:])
-    rest_std  = np.std(rms_segments[1:])
-    # Flag if any segment is >3 std above the rest-of-run mean
-    for i, rms in enumerate(rms_segments):
-        if rms > rest_mean + 3 * rest_std:
-            anomalies.append({
-                "type": "Early Degradation",
-                "severity": "HARD",
-                "sensor": "All Joints (RMS)",
-                "description": f"Segment {i} RMS ({rms:.4f}) is {(rms-rest_mean)/rest_std:.1f} std above run baseline ({rest_mean:.4f}). Unusual load spike at start of shift.",
-                "action": "Schedule full system diagnostic. Review startup sequence and compare to historical RMS profiles.",
-                "row_start": i * chunk_size,
-                "row_end": (i + 1) * chunk_size - 1,
-            })
+    # Per-joint 100-row chunk RMS vs same chunk in training — report tightest hit
+    chunk_size = 25
+    n_chunks   = len(df) // chunk_size
+    best_diff, best_result = 0.0, None
+    for col in CURRENT_COLS:
+        for i in range(n_chunks):
+            a_c = df[col].iloc[i*chunk_size:(i+1)*chunk_size]
+            t_c = training_df[col].iloc[i*chunk_size:(i+1)*chunk_size].dropna()
+            if len(t_c) < chunk_size // 2:
+                continue
+            a_rms = np.sqrt((a_c**2).mean())
+            t_rms = np.sqrt((t_c**2).mean())
+            diff  = abs(a_rms - t_rms)
+            if diff > best_diff:
+                best_diff   = diff
+                best_result = (col, i*chunk_size, (i+1)*chunk_size - 1, a_rms, t_rms)
+    if best_diff > 0.5:
+        col, s, e, a_rms, t_rms = best_result
+        direction = "elevated" if a_rms > t_rms else "reduced"
+        anomalies.append({
+            "type": "Early Degradation",
+            "severity": "HARD",
+            "sensor": col,
+            "description": f"{col} RMS {direction} in rows {s}–{e}: actual {a_rms:.4f} vs training {t_rms:.4f} (Δ{best_diff:.4f}).",
+            "action": "Schedule full system diagnostic. Compare to historical RMS profiles for this joint.",
+            "row_start": s,
+            "row_end":   e,
+        })
 
     return anomalies
-
-
-def compute_joint_correlations(training_df, baselines):
-    joint_pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
-    for j1, j2 in joint_pairs:
-        col_a = f"Current_J{j1}"
-        col_b = f"Current_J{j2}"
-        baselines[f"corr_{col_a}_{col_b}"] = training_df[col_a].corr(training_df[col_b])
-    return baselines
-
-
-def compute_sensor_fail_baselines(training_df, baselines):
-    """Store per-joint sensor failure counts from training data."""
-    for j in range(6):
-        sc = f"Speed_J{j}"
-        cc = f"Current_J{j}"
-        count = len(training_df[(training_df[sc].abs() > 1.0) & (training_df[cc].abs() < 0.05)])
-        baselines[f"sensor_fail_baseline_{j}"] = count
-    return baselines
 
 
 def run_full_analysis(training_path, actual_path):
     train  = pd.read_csv(training_path)
     actual = pd.read_csv(actual_path)
-
     baselines = compute_baselines(train)
     baselines = compute_joint_correlations(train, baselines)
     baselines = compute_sensor_fail_baselines(train, baselines)
-    anomalies = detect_anomalies(actual, baselines)
-
+    anomalies = detect_anomalies(actual, baselines, training_df=train)
     return baselines, anomalies
