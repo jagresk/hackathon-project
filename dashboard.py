@@ -1,26 +1,23 @@
+# dashboard.py
+import sys
+sys.path.insert(0, "/Users/jebdon/predictive-maintenance-hackathon")
 import streamlit as st
 import pandas as pd
-import numpy as np
+from src.anomaly_detection import run_full_analysis
+
+baselines, anomalies = run_full_analysis(
+    "data/training_data.csv",
+    "data/actual_data.csv"
+)
 
 st.title("Predictive Maintenance Dashboard")
+st.write(f"**Anomalies detected:** {len(anomalies)}")
+st.divider()
 
-# simulate sensor readings
-data = pd.DataFrame({
-    "temperature": np.random.normal(70,2,100),
-    "vibration": np.random.normal(0.3,0.05,100),
-    "pressure": np.random.normal(30,1,100)
-})
-
-st.subheader("Sensor Data")
-st.line_chart(data)
-
-# health indicator
-health = np.random.randint(70,100)
-
-st.subheader("Machine Health")
-st.metric("Health Score", f"{health}%")
-
-if health < 80:
-    st.error("⚠ Maintenance Recommended")
-else:
-    st.success("Machine Operating Normally")
+for a in anomalies:
+    color = "🔴" if a["severity"] == "HIGH" else "🟡" if a["severity"] == "MEDIUM" else "🔵"
+    st.subheader(f"{color} {a['type']} — {a['sensor']}")
+    st.write(f"**Rows:** {a['row_start']} – {a['row_end']}")
+    st.write(f"**Finding:** {a['description']}")
+    st.write(f"**Action:** {a['action']}")
+    st.divider()
